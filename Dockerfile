@@ -12,7 +12,8 @@ RUN npm run build
 FROM nginx:alpine
 RUN apk upgrade --no-cache
 
-COPY nginx/nginx.conf /etc/nginx/conf.d/default.conf
+ENV BACKEND_UPSTREAM=backend:3007
+COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
 
 EXPOSE 80
