@@ -1,0 +1,119 @@
+
+  cd:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: ci
+
+    # CD uniquement après un push ou merge dans main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      # Connexion Azure avec Client ID + Client Secret
+      - name: Connexion à Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Récupération des informations ACR
+      - name: Récupération des informations ACR
+        id: acr
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          ACR_SERVER=$(az acr show \
+            --name "$ACR_NAME" \
+            --query loginServer -o tsv)
+
+          echo "server=$ACR_SERVER" >> "$GITHUB_OUTPUT"
+
+      # Connexion à ACR
+      - name: Connexion à ACR
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          az acr login --name "$ACR_NAME"
+
+      # Build + scan backend
+      - name: Build et scan backend
+        env:
+          ACR_SERVER: ${{ steps.acr.outputs.server }}
+        run: |
+          docker build --platform linux/amd64 \
+            -t "$ACR_SERVER/quiz-backend:${{ github.sha }}" \
+            ./backend
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest \
+            image --exit-code 1 \
+            --severity CRITICAL \
+            "$ACR_SERVER/quiz-backend:${{ github.sha }}"
+
+      # Build + scan frontend
+      - name: Build et scan frontend
+        env:
+          ACR_SERVER: ${{ steps.acr.outputs.server }}
+        run: |
+          docker build --platform linux/amd64 \
+            -t "$ACR_SERVER/quiz-frontend:${{ github.sha }}" \
+            .
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest \
+            image --exit-code 1 \
+            --severity CRITICAL \
+            "$ACR_SERVER/quiz-frontend:${{ github.sha }}"
+
+      # Publication dans ACR
+      - name: Publication des images dans ACR
+        env:
+          ACR_SERVER: ${{ steps.acr.outputs.server }}
+        run: |
+          docker push "$ACR_SERVER/quiz-backend:${{ github.sha }}"
+          docker push "$ACR_SERVER/quiz-frontend:${{ github.sha }}"
+
+      # Mise à jour du backend
+      - name: Déploiement du backend
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          BACKEND_APP: ${{ vars.BACKEND_APP }}
+          ACR_SERVER: ${{ steps.acr.outputs.server }}
+        run: |
+          az containerapp update \
+            --name "$BACKEND_APP" \
+            --resource-group "$RG" \
+            --image "$ACR_SERVER/quiz-backend:${{ github.sha }}"
+
+      # Mise à jour du frontend
+      - name: Déploiement du frontend
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          FRONTEND_APP: ${{ vars.FRONTEND_APP }}
+          ACR_SERVER: ${{ steps.acr.outputs.server }}
+        run: |
+          az containerapp update \
+            --name "$FRONTEND_APP" \
+            --resource-group "$RG" \
+            --image "$ACR_SERVER/quiz-frontend:${{ github.sha }}" \
+            --set-env-vars "BACKEND_UPSTREAM=quiz-backend"
+
+      # Vérification des révisions
+      - name: Vérification des révisions Azure
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          BACKEND_APP: ${{ vars.BACKEND_APP }}
+          FRONTEND_APP: ${{ vars.FRONTEND_APP }}
+        run: |
+          for APP in "$BACKEND_APP" "$FRONTEND_APP"; do
+            echo "Révisions de $APP"
+
+            az containerapp revision list \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --query "[].{revision:name, actif:properties.active, image:properties.template.containers[0].image}" \
+              -o table
+          done
