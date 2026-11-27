@@ -1,23 +1,29 @@
-
 name: Quiz App CI/CD
 
 on:
-  # CI sur les Pull Requests vers main
+  # J6-A : CI sur chaque Pull Request vers main
   pull_request:
     branches:
       - main
 
-  # CI sur les branches et CD après push dans main
+  # J6-B : CI puis CD après fusion dans main
   push:
     branches:
-      - "**"
+      - main
 
-  # Permet de lancer la pipeline manuellement
+  # Lancement manuel (CI uniquement, le CD exige un push sur main)
   workflow_dispatch:
 
+# Moindre privilège : lecture seule par défaut.
+# Le droit OIDC (id-token) est accordé uniquement au job de déploiement.
 permissions:
   contents: read
-  id-token: write
+
+env:
+  # Version de Trivy fixée (pas de "latest")
+  TRIVY_IMAGE: aquasec/trivy:0.70.0
+  BACKEND_IMAGE: quiz-backend:${{ github.sha }}
+  FRONTEND_IMAGE: quiz-frontend:${{ github.sha }}
 
 jobs:
 
@@ -32,35 +38,73 @@ jobs:
       - name: Récupération du dépôt
         uses: actions/checkout@v4
 
+      - name: Préparation du cache Trivy et du dossier des rapports
+        run: mkdir -p "$HOME/.cache/trivy" trivy-reports
+
+      # ---------- Backend ----------
       - name: Construction de l'image backend
         run: |
           docker build --platform linux/amd64 \
-            -t quiz-backend:${{ github.sha }} \
+            -t "$BACKEND_IMAGE" \
             ./backend
 
-      - name: Scan Trivy du backend
+      - name: Scan Trivy du backend (bloquant sur CRITICAL)
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" \
             image --exit-code 1 \
             --severity CRITICAL \
-            quiz-backend:${{ github.sha }}
+            --no-progress \
+            "$BACKEND_IMAGE" | tee trivy-reports/trivy-backend.txt
 
+      # ---------- Frontend ----------
+      # !cancelled() : le frontend est construit et scanné même si le
+      # scan backend a échoué, pour obtenir les deux rapports.
+      # Le job reste en échec : aucun résultat n'est ignoré.
       - name: Construction de l'image frontend
+        if: ${{ !cancelled() }}
         run: |
           docker build --platform linux/amd64 \
-            -t quiz-frontend:${{ github.sha }} \
+            -t "$FRONTEND_IMAGE" \
             .
 
-      - name: Scan Trivy du frontend
+      - name: Scan Trivy du frontend (bloquant sur CRITICAL)
+        if: ${{ !cancelled() }}
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" \
             image --exit-code 1 \
             --severity CRITICAL \
-            quiz-frontend:${{ github.sha }}
+            --no-progress \
+            "$FRONTEND_IMAGE" | tee trivy-reports/trivy-frontend.txt
+
+      # ---------- Preuves ----------
+      - name: Publication des rapports Trivy
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapports-trivy-${{ github.sha }}
+          path: trivy-reports/
+          retention-days: 30
+
+      # Sur main uniquement : on conserve les images VALIDÉES pour le CD,
+      # afin de publier exactement ce qui a été scanné (pas de reconstruction).
+      - name: Sauvegarde des images validées
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          docker save "$BACKEND_IMAGE" "$FRONTEND_IMAGE" | gzip > images.tar.gz
+
+      - name: Transmission des images validées au CD
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-validees-${{ github.sha }}
+          path: images.tar.gz
+          retention-days: 1
 
   # ==========================================
   # J6-B : DEPLOIEMENT CONTINU
@@ -68,116 +112,110 @@ jobs:
   cd:
     name: Deploy to Azure
     runs-on: ubuntu-latest
-
     needs: ci
 
-    # Déploiement uniquement après une fusion
-    # ou un push direct dans main
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Déploiement uniquement après fusion (push) dans main, jamais sur une PR
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+    # Un seul déploiement à la fois
+    concurrency:
+      group: deploy-azure
+      cancel-in-progress: false
+
+    # OIDC : seul ce job peut obtenir un jeton Azure
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      BACKEND_APP: ${{ vars.BACKEND_APP }}
+      FRONTEND_APP: ${{ vars.FRONTEND_APP }}
 
     steps:
-      - name: Récupération du dépôt
-        uses: actions/checkout@v4
+      - name: Récupération des images validées par la CI
+        uses: actions/download-artifact@v4
+        with:
+          name: images-validees-${{ github.sha }}
 
-      # Connexion Azure avec OpenID Connect
-      - name: Connexion à Azure
+      - name: Chargement des images
+        run: gunzip -c images.tar.gz | docker load
+
+      - name: Connexion à Azure (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Récupération des informations ACR
-        id: acr
-        env:
-          ACR_NAME: ${{ vars.ACR_NAME }}
-        run: |
-          ACR_SERVER=$(az acr show \
-            --name "$ACR_NAME" \
-            --query loginServer -o tsv)
-
-          echo "server=$ACR_SERVER" >> "$GITHUB_OUTPUT"
-
       - name: Connexion à ACR
-        env:
-          ACR_NAME: ${{ vars.ACR_NAME }}
+        id: acr
         run: |
+          ACR_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          echo "server=$ACR_SERVER" >> "$GITHUB_OUTPUT"
           az acr login --name "$ACR_NAME"
 
-      # Construction et scan avant publication
-      - name: Build et scan backend
+      - name: Publication des images validées dans ACR
         env:
           ACR_SERVER: ${{ steps.acr.outputs.server }}
         run: |
-          docker build --platform linux/amd64 \
-            -t "$ACR_SERVER/quiz-backend:${{ github.sha }}" \
-            ./backend
+          docker tag "$BACKEND_IMAGE"  "$ACR_SERVER/$BACKEND_IMAGE"
+          docker tag "$FRONTEND_IMAGE" "$ACR_SERVER/$FRONTEND_IMAGE"
+          docker push "$ACR_SERVER/$BACKEND_IMAGE"
+          docker push "$ACR_SERVER/$FRONTEND_IMAGE"
 
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest \
-            image --exit-code 1 \
-            --severity CRITICAL \
-            "$ACR_SERVER/quiz-backend:${{ github.sha }}"
-
-      - name: Build et scan frontend
-        env:
-          ACR_SERVER: ${{ steps.acr.outputs.server }}
-        run: |
-          docker build --platform linux/amd64 \
-            -t "$ACR_SERVER/quiz-frontend:${{ github.sha }}" \
-            .
-
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest \
-            image --exit-code 1 \
-            --severity CRITICAL \
-            "$ACR_SERVER/quiz-frontend:${{ github.sha }}"
-
-      # Publication dans Azure Container Registry
-      - name: Publication des images dans ACR
-        env:
-          ACR_SERVER: ${{ steps.acr.outputs.server }}
-        run: |
-          docker push "$ACR_SERVER/quiz-backend:${{ github.sha }}"
-          docker push "$ACR_SERVER/quiz-frontend:${{ github.sha }}"
-
-      # Mise à jour des applications Azure
       - name: Déploiement du backend
         env:
-          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
-          BACKEND_APP: ${{ vars.BACKEND_APP }}
           ACR_SERVER: ${{ steps.acr.outputs.server }}
         run: |
           az containerapp update \
             --name "$BACKEND_APP" \
             --resource-group "$RG" \
-            --image "$ACR_SERVER/quiz-backend:${{ github.sha }}"
+            --image "$ACR_SERVER/$BACKEND_IMAGE" \
+            -o none
 
       - name: Déploiement du frontend
         env:
-          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
-          FRONTEND_APP: ${{ vars.FRONTEND_APP }}
           ACR_SERVER: ${{ steps.acr.outputs.server }}
         run: |
           az containerapp update \
             --name "$FRONTEND_APP" \
             --resource-group "$RG" \
-            --image "$ACR_SERVER/quiz-frontend:${{ github.sha }}" \
-            --set-env-vars "BACKEND_UPSTREAM=quiz-backend"
+            --image "$ACR_SERVER/$FRONTEND_IMAGE" \
+            --set-env-vars "BACKEND_UPSTREAM=$BACKEND_APP" \
+            -o none
 
-      # Vérification des révisions
-      - name: Vérification des révisions Azure
+      # Preuves : tags, digests ACR et révisions, dans le résumé du workflow
+      - name: Preuves de déploiement (digests et révisions)
         env:
-          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          ACR_SERVER: ${{ steps.acr.outputs.server }}
         run: |
-          for APP in quiz-backend quiz-frontend; do
-            echo "Révisions de $APP"
+          {
+            echo "## Déploiement du commit \`${GITHUB_SHA::7}\`"
+            echo
+            echo "### Images publiées dans ACR"
+            echo
+            echo "| Image | Digest |"
+            echo "|---|---|"
+            for IMG in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
+              DIGEST=$(az acr repository show --name "$ACR_NAME" --image "$IMG" --query digest -o tsv)
+              echo "| \`$ACR_SERVER/$IMG\` | \`$DIGEST\` |"
+            done
+            for APP in "$BACKEND_APP" "$FRONTEND_APP"; do
+              echo
+              echo "### Révisions de $APP"
+              echo
+              echo '```'
+              az containerapp revision list \
+                --name "$APP" \
+                --resource-group "$RG" \
+                --query "[].{revision:name, active:properties.active, creee:properties.createdTime, image:properties.template.containers[0].image}" \
+                -o table
+              echo '```'
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-            az containerapp revision list \
-              --name "$APP" \
-              --resource-group "$RG" \
-              --query "[].{revision:name, actif:properties.active, image:properties.template.containers[0].image}" \
-              -o table
-          done
+      - name: Déconnexion d'Azure
+        if: ${{ always() }}
+        run: az logout || true
